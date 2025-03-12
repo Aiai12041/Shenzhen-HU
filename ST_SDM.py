@@ -1,129 +1,218 @@
+import os
 import numpy as np
-import pandas as pd
-from pysal.lib import weights
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense, concatenate, RepeatVector, TimeDistributed
-from sklearn.preprocessing import StandardScaler
-from keras.optimizers import Adam
+import rasterio
+from rasterio.merge import merge
+from rasterio.warp import calculate_default_transform, reproject
+from datetime import datetime
+import glob
+import re
 
-# 设置随机种子确保结果可复现
-np.random.seed(42)
+class Config:
+    # 路径配置
+    ppi_dir = "./PPI_output/"
+    hsi_path = "./hsi_results_utm50n.tif"
+    hhi_path = "./poi_hhi_output.tif"
+    output_dir = "./hcewi/"
+    ppi_pattern = r"PPI_sz_clipped_raster_(\d{4})_(\d{2})\.tif$"  # PPI文件名匹配模式
 
-# 定义区域数量
-regions = 100
+    # 空间参考配置（以HSI文件为基准）
+    target_crs = None  # 自动获取
+    target_transform = None
+    target_shape = None
 
-# 模拟数据生成
-time_range = pd.date_range('2017-06', '2019-06', freq='M')
+def setup_output_metadata():
+    """设置输出空间参考元数据"""
+    with rasterio.open(Config.hsi_path) as src:
+        Config.target_crs = src.crs
+        Config.target_transform = src.transform
+        Config.target_shape = src.shape
 
-# 生成动态PPI数据（面板数据）
-ppi_data = {
-    'region_id': np.repeat(np.arange(regions), len(time_range)),
-    'date': np.tile(time_range, regions),
-    'PPI': np.random.normal(100, 10, regions*len(time_range))
-}
+def parse_ppi_datetime(filename):
+    """使用正则表达式解析时间信息"""
+    match = re.search(Config.ppi_pattern, filename, re.IGNORECASE)
+    if match:
+        year, month = map(int, match.groups())
+        return datetime(year, month, 1)
+    raise ValueError(f"无法解析文件名中的时间信息：{filename}")
 
-# 生成静态HSI/HHI数据（横截面数据）
-static_data = {
-    'region_id': np.arange(regions),
-    'HSI': np.random.uniform(0, 1, regions),
-    'HHI': np.random.uniform(0.2, 0.8, regions)
-}
+def load_static_data(path):
+    """加载静态数据并重投影到目标坐标系"""
+    with rasterio.open(path) as src:
+        # 如果坐标系不一致则自动重投影
+        if src.crs != Config.target_crs:
+            transform, width, height = calculate_default_transform(
+                src.crs, Config.target_crs, src.width, src.height, *src.bounds)
+            data = np.empty((height, width), dtype=np.float32)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=data,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs=Config.target_crs)
+            return data
+        return src.read(1)
 
-# 创建数据框
-df_dynamic = pd.DataFrame(ppi_data)
-df_static = pd.DataFrame(static_data)
+def process_ppi_files():
+    """改进的文件处理函数"""
+    ppi_files = sorted(
+        glob.glob(os.path.join(Config.ppi_dir, "PPI_sz_clipped_raster_*.tif")),
+        key=lambda x: parse_ppi_datetime(os.path.basename(x))
+    )
+    
+    for ppi_file in ppi_files:
+        # 解析时间并过滤
+        date = parse_ppi_datetime(os.path.basename(ppi_file))
+        if date < datetime(2017,6,1) or date > datetime(2019,6,30):
+            continue
+        
+        # 显示处理进度
+        print(f"正在处理：{os.path.basename(ppi_file)}")
+        
+        # 加载和处理数据
+        with rasterio.open(ppi_file) as src:
+            ppi = src.read(1)
+            # 自动重投影对齐
+            if src.crs != Config.target_crs:
+                ppi = reproject_to_target(ppi, src)
+        
+        # 执行计算流程
+        calculate_hcewi_for_month(ppi, date)
 
-# 创建空间权重矩阵（示例）
-coordinates = np.random.rand(regions, 2)
-w = weights.KNN(coordinates, k=4)
-w.transform = 'r'
+def reproject_to_target(data, src):
+    """数据重投影到目标坐标系"""
+    transformed = np.empty(Config.target_shape, dtype=np.float32)
+    reproject(
+        source=data,
+        destination=transformed,
+        src_transform=src.transform,
+        src_crs=src.crs,
+        dst_transform=Config.target_transform,
+        dst_crs=Config.target_crs)
+    return transformed
 
-# 计算静态变量的空间滞后
-static_vars = ['HSI', 'HHI']
-for var in static_vars:
-    df_static[f'W_{var}'] = weights.spatial_lag.lag_spatial(w, df_static[var].values.reshape(-1,1))
+def safe_normalization(data, name=""):
+    """安全归一化到0-1范围"""
+    data_min = np.nanmin(data)
+    data_max = np.nanmax(data)
+    denominator = data_max - data_min
+    
+    if denominator < 1e-10:
+        print(f"警告：{name}数据值域接近零({data_min:.2f}-{data_max:.2f})，使用默认归一化")
+        normalized = np.zeros_like(data)
+    else:
+        normalized = (data - data_min) / denominator
+        
+    # 处理NaN值
+    normalized = np.nan_to_num(normalized, nan=0.0)
+    return np.clip(normalized, 0, 1)
 
-# 合并动态静态数据
-full_data = df_dynamic.merge(df_static, on='region_id')
+def calculate_hcewi_for_month(ppi, date):
+    """单个月份的HCEWI计算"""
+    # 检查数据有效性
+    if np.all(np.isnan(ppi)):
+        print(f"警告：{date.strftime('%Y%m')} 的PPI数据全为NaN，跳过处理")
+        return
+    
+    # 数据标准化（新添加的0-1归一化）
+    ppi_norm = safe_normalization(ppi, name="PPI")
+    
+    # 加载静态数据（仅首次加载时处理）
+    if not hasattr(Config, 'hsi_norm'):
+        print("加载静态数据...")
+        
+        # 加载并标准化HSI
+        Config.hsi = load_static_data(Config.hsi_path)
+        Config.hsi_norm = safe_normalization(Config.hsi, name="HSI")
+        
+        # 加载并标准化HHI
+        Config.hhi = load_static_data(Config.hhi_path)
+        Config.hhi_norm = safe_normalization(Config.hhi, name="HHI")
+        
+        # 计算空间权重矩阵
+        Config.weights = calculate_spatial_weights(Config.hsi_norm, Config.hhi_norm)
+    
+    # 合成指标（添加安全约束）
+    hcewi = (
+        Config.weights[...,0] * ppi_norm +
+        Config.weights[...,1] * Config.hsi_norm +
+        Config.weights[...,2] * Config.hhi_norm
+    )
+    
+    # 结果后处理
+    hcewi = np.clip(hcewi, 0, 1)  # 强制限定到0-1范围
+    hcewi = np.nan_to_num(hcewi, nan=0.0)  # 清除残留NaN
+    
+    # 输出诊断信息
+    valid_ratio = np.mean((hcewi > 0) & (hcewi < 1)) * 100
+    print(f"[{date.strftime('%Y%m')}] 有效值比例：{valid_ratio:.1f}% 数值范围：({hcewi.min():.3f}, {hcewi.max():.3f})")
+    
+    # 输出结果
+    output_path = os.path.join(Config.output_dir, f"hcewi_{date.strftime('%Y%m')}.tif")
+    write_geotiff(output_path, hcewi)
 
-# 添加时间编码
-full_data['month'] = full_data['date'].dt.month
-full_data['month_sin'] = np.sin(2 * np.pi * full_data['month']/12)
-full_data['month_cos'] = np.cos(2 * np.pi * full_data['month']/12)
+def calculate_spatial_weights(hsi, hhi):
+    """改进的空间权重计算方法"""
+    valid_mask = ~np.isnan(hsi) & ~np.isnan(hhi)
+    
+    # 更新变异系数计算方法
+    def safe_cv(data):
+        mean = np.nanmean(data)
+        std = np.nanstd(data)
+        if mean < 1e-10:  # 处理接近零的均值
+            return 0.0
+        return std / mean
+    
+    window_size = 7
+    weights = np.zeros((*hsi.shape, 3))
+    
+    for i in range(hsi.shape[0]):
+        for j in range(hsi.shape[1]):
+            if not valid_mask[i,j]:
+                weights[i,j] = [0.333, 0.333, 0.334]
+                continue
+                
+            i_min = max(0, i - window_size//2)
+            i_max = min(hsi.shape[0], i + window_size//2 + 1)
+            j_min = max(0, j - window_size//2)
+            j_max = min(hsi.shape[1], j + window_size//2 + 1)
+            
+            local_hsi = hsi[i_min:i_max, j_min:j_max]
+            local_hhi = hhi[i_min:i_max, j_min:j_max]
+            
+            # 添加平滑处理
+            w1 = safe_cv(local_hsi) if local_hsi.size > 0 else 0.0
+            w2 = safe_cv(local_hhi) if local_hhi.size > 0 else 0.0
+            w3 = 1.0  # 基础权重
+            
+            # 权重归一化
+            total = w1 + w2 + w3
+            if total < 1e-10:
+                weights[i,j] = [0.333, 0.333, 0.334]
+            else:
+                weights[i,j] = [w1/total, w2/total, w3/total]
+    
+    return weights
 
-# 定义特征
-dynamic_features = ['PPI', 'month_sin', 'month_cos']  # 随时间变化的特征
-static_features = ['HSI', 'HHI', 'W_HSI', 'W_HHI']  # 静态特征
+def write_geotiff(path, data):
+    """写入GeoTIFF文件"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with rasterio.open(
+        path,
+        'w',
+        driver='GTiff',
+        height=data.shape[0],
+        width=data.shape[1],
+        count=1,
+        dtype=np.float32,
+        crs=Config.target_crs,
+        transform=Config.target_transform,
+        nodata=np.nan
+    ) as dst:
+        dst.write(data.astype(np.float32), 1)
+    print(f"生成文件：{path}")
 
-# 数据标准化
-scaler_dynamic = StandardScaler()
-scaler_static = StandardScaler()
-
-# 分别标准化动态和静态特征
-full_data[dynamic_features] = scaler_dynamic.fit_transform(full_data[dynamic_features])
-full_data[static_features] = scaler_static.fit_transform(full_data[static_features])
-
-# 构建时空序列数据
-def create_sequences(data, region_ids, time_steps):
-    X_dynamic, X_static, y = [], [], []
-    for r in region_ids:
-        region_data = data[data['region_id'] == r].sort_values('date')
-        static_values = region_data[static_features].iloc[0]  # 静态特征只取一次
-        for i in range(len(region_data)-time_steps):
-            X_dynamic.append(region_data[dynamic_features].values[i:i+time_steps])
-            X_static.append(static_values.values)
-            y.append(region_data['PPI'].values[i+time_steps])
-    return np.array(X_dynamic), np.array(X_static), np.array(y)
-
-# 创建训练序列
-time_steps = 6
-X_dyn, X_stat, y = create_sequences(full_data, np.arange(regions), time_steps)
-
-print(f"数据形状: X_dynamic={X_dyn.shape}, X_static={X_stat.shape}, y={y.shape}")
-
-# 构建混合模型
-# 动态特征分支
-dynamic_input = Input(shape=(time_steps, len(dynamic_features)))
-lstm = LSTM(64, return_sequences=True)(dynamic_input)
-lstm_out = LSTM(32)(lstm)
-
-# 静态特征分支
-static_input = Input(shape=(len(static_features),))
-static_dense = Dense(16, activation='relu')(static_input)
-
-# 特征融合
-merged = concatenate([lstm_out, static_dense])
-dense1 = Dense(32, activation='relu')(merged)
-output = Dense(1)(dense1)
-
-# 创建模型
-model = Model(inputs=[dynamic_input, static_input], outputs=output)
-model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-
-print(model.summary())
-
-# 模型训练
-history = model.fit(
-    [X_dyn, X_stat], y, 
-    epochs=50, 
-    batch_size=32, 
-    validation_split=0.2,
-    verbose=1
-)
-
-# 保存模型
-model.save('st_sdm_model.h5')
-print("模型训练完成并保存")
-
-# 可视化训练过程
-import matplotlib.pyplot as plt
-
-plt.figure(figsize=(10, 6))
-plt.plot(history.history['loss'], label='训练损失')
-plt.plot(history.history['val_loss'], label='验证损失') 
-plt.title('模型训练过程')
-plt.xlabel('Epochs')
-plt.ylabel('损失')
-plt.legend()
-plt.savefig('training_history.png')
-plt.show()
+if __name__ == "__main__":
+    setup_output_metadata()
+    process_ppi_files()
+    print("处理完成！")
