@@ -1,218 +1,196 @@
-import os
+import pandas as pd
+import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.merge import merge
-from rasterio.warp import calculate_default_transform, reproject
-from datetime import datetime
-import glob
-import re
+from rasterio.crs import CRS
+from rasterio.warp import transform_geom
+from rasterio.features import rasterize
+from shapely.geometry import Point, box
+from pyproj import Transformer
 
-class Config:
-    # 路径配置
-    ppi_dir = "./PPI_output/"
-    hsi_path = "./hsi_results_utm50n.tif"
-    hhi_path = "./poi_hhi_output.tif"
-    output_dir = "./hcewi/"
-    ppi_pattern = r"PPI_sz_clipped_raster_(\d{4})_(\d{2})\.tif$"  # PPI文件名匹配模式
+def coordinate_transformation():
+    """坐标转换与数据整合流程"""
+    # 配置参数
+    config = {
+        'poi_csv': r"D:\houseuse\yga_poi_file_84\深圳市_poi_84.csv",
+        'building_raster': r"D:\houseuse\generated_vbd_sz.tif",
+        'output_hsi': r"D:\houseuse\hsi_results_utm50n.tif"  # 修改为.tif后缀
+    }
 
-    # 空间参考配置（以HSI文件为基准）
-    target_crs = None  # 自动获取
-    target_transform = None
-    target_shape = None
+    # 1. 读取建筑密度栅格元数据
+    with rasterio.open(config['building_raster']) as src:
+        raster_crs = src.crs  # 应为EPSG:32650
+        raster_transform = src.transform
+        raster_bounds = src.bounds
+        raster_shape = src.shape
+        raster_meta = src.meta.copy()
+        print(f"栅格坐标系: {raster_crs}\n范围: {raster_bounds}")
 
-def setup_output_metadata():
-    """设置输出空间参考元数据"""
-    with rasterio.open(Config.hsi_path) as src:
-        Config.target_crs = src.crs
-        Config.target_transform = src.transform
-        Config.target_shape = src.shape
-
-def parse_ppi_datetime(filename):
-    """使用正则表达式解析时间信息"""
-    match = re.search(Config.ppi_pattern, filename, re.IGNORECASE)
-    if match:
-        year, month = map(int, match.groups())
-        return datetime(year, month, 1)
-    raise ValueError(f"无法解析文件名中的时间信息：{filename}")
-
-def load_static_data(path):
-    """加载静态数据并重投影到目标坐标系"""
-    with rasterio.open(path) as src:
-        # 如果坐标系不一致则自动重投影
-        if src.crs != Config.target_crs:
-            transform, width, height = calculate_default_transform(
-                src.crs, Config.target_crs, src.width, src.height, *src.bounds)
-            data = np.empty((height, width), dtype=np.float32)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=data,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=transform,
-                dst_crs=Config.target_crs)
-            return data
-        return src.read(1)
-
-def process_ppi_files():
-    """改进的文件处理函数"""
-    ppi_files = sorted(
-        glob.glob(os.path.join(Config.ppi_dir, "PPI_sz_clipped_raster_*.tif")),
-        key=lambda x: parse_ppi_datetime(os.path.basename(x))
+    # 2. 读取并转换POI数据坐标系
+    poi_df = pd.read_csv(config['poi_csv'], encoding='gbk')
+    
+    # 2.1 根据类型前四个字符分类住宅POI
+    poi_df['is_residential'] = poi_df['类型'].apply(
+        lambda x: 1 if x[:4] in ['住宿服务', '商务住宅'] else 0
     )
+    print(f"住宅类POI数量: {poi_df['is_residential'].sum()}")
+    print(f"非住宅类POI数量: {len(poi_df) - poi_df['is_residential'].sum()}")
     
-    for ppi_file in ppi_files:
-        # 解析时间并过滤
-        date = parse_ppi_datetime(os.path.basename(ppi_file))
-        if date < datetime(2017,6,1) or date > datetime(2019,6,30):
-            continue
-        
-        # 显示处理进度
-        print(f"正在处理：{os.path.basename(ppi_file)}")
-        
-        # 加载和处理数据
-        with rasterio.open(ppi_file) as src:
-            ppi = src.read(1)
-            # 自动重投影对齐
-            if src.crs != Config.target_crs:
-                ppi = reproject_to_target(ppi, src)
-        
-        # 执行计算流程
-        calculate_hcewi_for_month(ppi, date)
+    # 2.2 创建WGS84几何对象
+    geometry = [Point(xy) for xy in zip(poi_df['经度_84'], poi_df['纬度_84'])]
+    poi_gdf = gpd.GeoDataFrame(poi_df, geometry=geometry, crs='EPSG:4326')
+    
+    # 2.3 转换到UTM50N (EPSG:32650)
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:32650", always_xy=True)
+    poi_gdf['geometry'] = [Point(transformer.transform(pt.x, pt.y)) for pt in poi_gdf.geometry]
+    poi_gdf.crs = CRS.from_epsg(32650)
+    print(f"转换后POI坐标系验证: {poi_gdf.crs}")
 
-def reproject_to_target(data, src):
-    """数据重投影到目标坐标系"""
-    transformed = np.empty(Config.target_shape, dtype=np.float32)
-    reproject(
-        source=data,
-        destination=transformed,
-        src_transform=src.transform,
-        src_crs=src.crs,
-        dst_transform=Config.target_transform,
-        dst_crs=Config.target_crs)
-    return transformed
-
-def safe_normalization(data, name=""):
-    """安全归一化到0-1范围"""
-    data_min = np.nanmin(data)
-    data_max = np.nanmax(data)
-    denominator = data_max - data_min
-    
-    if denominator < 1e-10:
-        print(f"警告：{name}数据值域接近零({data_min:.2f}-{data_max:.2f})，使用默认归一化")
-        normalized = np.zeros_like(data)
-    else:
-        normalized = (data - data_min) / denominator
-        
-    # 处理NaN值
-    normalized = np.nan_to_num(normalized, nan=0.0)
-    return np.clip(normalized, 0, 1)
-
-def calculate_hcewi_for_month(ppi, date):
-    """单个月份的HCEWI计算"""
-    # 检查数据有效性
-    if np.all(np.isnan(ppi)):
-        print(f"警告：{date.strftime('%Y%m')} 的PPI数据全为NaN，跳过处理")
-        return
-    
-    # 数据标准化（新添加的0-1归一化）
-    ppi_norm = safe_normalization(ppi, name="PPI")
-    
-    # 加载静态数据（仅首次加载时处理）
-    if not hasattr(Config, 'hsi_norm'):
-        print("加载静态数据...")
-        
-        # 加载并标准化HSI
-        Config.hsi = load_static_data(Config.hsi_path)
-        Config.hsi_norm = safe_normalization(Config.hsi, name="HSI")
-        
-        # 加载并标准化HHI
-        Config.hhi = load_static_data(Config.hhi_path)
-        Config.hhi_norm = safe_normalization(Config.hhi, name="HHI")
-        
-        # 计算空间权重矩阵
-        Config.weights = calculate_spatial_weights(Config.hsi_norm, Config.hhi_norm)
-    
-    # 合成指标（添加安全约束）
-    hcewi = (
-        Config.weights[...,0] * ppi_norm +
-        Config.weights[...,1] * Config.hsi_norm +
-        Config.weights[...,2] * Config.hhi_norm
-    )
-    
-    # 结果后处理
-    hcewi = np.clip(hcewi, 0, 1)  # 强制限定到0-1范围
-    hcewi = np.nan_to_num(hcewi, nan=0.0)  # 清除残留NaN
-    
-    # 输出诊断信息
-    valid_ratio = np.mean((hcewi > 0) & (hcewi < 1)) * 100
-    print(f"[{date.strftime('%Y%m')}] 有效值比例：{valid_ratio:.1f}% 数值范围：({hcewi.min():.3f}, {hcewi.max():.3f})")
-    
-    # 输出结果
-    output_path = os.path.join(Config.output_dir, f"hcewi_{date.strftime('%Y%m')}.tif")
-    write_geotiff(output_path, hcewi)
-
-def calculate_spatial_weights(hsi, hhi):
-    """改进的空间权重计算方法"""
-    valid_mask = ~np.isnan(hsi) & ~np.isnan(hhi)
-    
-    # 更新变异系数计算方法
-    def safe_cv(data):
-        mean = np.nanmean(data)
-        std = np.nanstd(data)
-        if mean < 1e-10:  # 处理接近零的均值
-            return 0.0
-        return std / mean
-    
-    window_size = 7
-    weights = np.zeros((*hsi.shape, 3))
-    
-    for i in range(hsi.shape[0]):
-        for j in range(hsi.shape[1]):
-            if not valid_mask[i,j]:
-                weights[i,j] = [0.333, 0.333, 0.334]
-                continue
-                
-            i_min = max(0, i - window_size//2)
-            i_max = min(hsi.shape[0], i + window_size//2 + 1)
-            j_min = max(0, j - window_size//2)
-            j_max = min(hsi.shape[1], j + window_size//2 + 1)
+    # 3. 创建与栅格对齐的分析网格
+    def create_aligned_grid():
+        """生成与输入栅格完全对齐的矢量网格"""
+        with rasterio.open(config['building_raster']) as src:
+            # 获取栅格行列数
+            width = src.width
+            height = src.height
+            transform = src.transform
             
-            local_hsi = hsi[i_min:i_max, j_min:j_max]
-            local_hhi = hhi[i_min:i_max, j_min:j_max]
-            
-            # 添加平滑处理
-            w1 = safe_cv(local_hsi) if local_hsi.size > 0 else 0.0
-            w2 = safe_cv(local_hhi) if local_hhi.size > 0 else 0.0
-            w3 = 1.0  # 基础权重
-            
-            # 权重归一化
-            total = w1 + w2 + w3
-            if total < 1e-10:
-                weights[i,j] = [0.333, 0.333, 0.334]
-            else:
-                weights[i,j] = [w1/total, w2/total, w3/total]
-    
-    return weights
+            # 生成网格单元几何
+            grid_geoms = []
+            grid_ids = []
+            for row in range(height):
+                for col in range(width):
+                    # 计算每个格子的地理坐标
+                    xmin, ymin = transform * (col, row+1)  # 注意y方向
+                    xmax, ymax = transform * (col+1, row)
+                    grid_geoms.append(box(xmin, ymin, xmax, ymax))
+                    grid_ids.append(row * width + col)  # 行优先索引
+        
+        return gpd.GeoDataFrame({'grid_id': grid_ids, 'geometry': grid_geoms}, crs=src.crs)
 
-def write_geotiff(path, data):
-    """写入GeoTIFF文件"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with rasterio.open(
-        path,
-        'w',
-        driver='GTiff',
-        height=data.shape[0],
-        width=data.shape[1],
-        count=1,
-        dtype=np.float32,
-        crs=Config.target_crs,
-        transform=Config.target_transform,
-        nodata=np.nan
-    ) as dst:
-        dst.write(data.astype(np.float32), 1)
-    print(f"生成文件：{path}")
+    grid_gdf = create_aligned_grid()
+    print(f"创建分析网格: {len(grid_gdf)}个单元")
+
+    # 4. 精确空间连接
+    def spatial_join_precision():
+        """带坐标容差的空间连接"""
+        # 设置容差为半个像素大小
+        tolerance = raster_transform.a / 2
+        
+        # 执行空间连接
+        joined = gpd.sjoin(poi_gdf, grid_gdf, how='inner', predicate='intersects')
+        print(f"成功匹配{len(joined)}个POI点")
+        
+        # 统计每个网格的住宅和非住宅POI
+        grid_poi_stats = pd.DataFrame(index=grid_gdf.index)
+        
+        # 住宅类POI数量
+        residential = joined[joined['is_residential'] == 1].groupby('index_right').size()
+        grid_poi_stats['residential_poi'] = residential.reindex(grid_gdf.index).fillna(0)
+        
+        # 非住宅类POI数量
+        non_residential = joined[joined['is_residential'] == 0].groupby('index_right').size()
+        grid_poi_stats['non_residential_poi'] = non_residential.reindex(grid_gdf.index).fillna(0)
+        
+        # 合并到网格
+        return grid_gdf.join(grid_poi_stats)
+
+    # 获取带POI信息的网格
+    grid_poi = spatial_join_precision()
+    print(f"POI统计完成，列包括: {grid_poi.columns.tolist()}")
+
+    # 5. 建筑密度数据处理
+    def extract_building_density(input_grid):
+        """从栅格中提取密度值到网格
+        
+        Args:
+            input_grid: 输入网格GeoDataFrame，保留其中已有的列
+        """
+        result = input_grid.copy()  # 创建副本避免修改原始数据
+        
+        with rasterio.open(config['building_raster']) as src:
+            # 将栅格数据读取为数组
+            data = src.read(1)
+            
+            # 展平数组并与网格对应
+            result['building_density'] = data.flatten()
+            
+        print(f"建筑密度提取完成，列包括: {result.columns.tolist()}")
+        return result
+
+    # 使用带POI的网格添加建筑密度
+    grid_data = extract_building_density(grid_poi)  # 修改这里，传入grid_poi
+
+    # 6. 计算HSI指数
+    def calculate_hsi(grid):
+        """住房供给潜力指数计算"""
+        # 检查必要的列是否存在
+        required_cols = ['residential_poi', 'non_residential_poi', 'building_density']
+        for col in required_cols:
+            if col not in grid.columns:
+                raise KeyError(f"缺少计算HSI所需的列: {col}")
+        
+        # 6.1 处理住宅比例
+        total_poi = grid['residential_poi'] + grid['non_residential_poi']
+        # 避免除零错误
+        grid['res_ratio'] = np.where(
+            total_poi > 0,
+            grid['residential_poi'] / total_poi,
+            0  # 如果没有POI，住宅比例设为0
+        )
+        
+        # 6.2 建筑密度标准化
+        density_range = grid['building_density'].max() - grid['building_density'].min()
+        if density_range > 0:
+            grid['density_norm'] = (grid['building_density'] - grid['building_density'].min()) / density_range
+        else:
+            grid['density_norm'] = 0
+        
+        # 6.3 合成HSI
+        grid['HSI'] = 0.7 * grid['density_norm'] + 0.3 * grid['res_ratio']
+        print(f"HSI计算完成，值范围: {grid['HSI'].min():.4f}-{grid['HSI'].max():.4f}，均值: {grid['HSI'].mean():.4f}")
+        return grid
+
+    final_grid = calculate_hsi(grid_data)
+
+    # 7. 保存结果为TIF栅格
+    def save_to_tif(grid_df, output_path, reference_meta):
+        """将结果保存为TIF栅格格式"""
+        # 准备元数据
+        meta = reference_meta.copy()
+        meta.update({
+            'dtype': 'float32',
+            'nodata': -9999,
+            'count': 1
+        })
+        
+        # 创建HSI栅格数组
+        height = meta['height']
+        width = meta['width']
+        hsi_raster = np.full((height, width), meta['nodata'], dtype='float32')
+        
+        # 填充HSI值
+        for idx, row in grid_df.iterrows():
+            grid_id = int(row['grid_id'])
+            col = grid_id % width
+            row_idx = grid_id // width
+            hsi_raster[row_idx, col] = row['HSI']
+        
+        # 写入栅格文件
+        with rasterio.open(output_path, 'w', **meta) as dst:
+            dst.write(hsi_raster, 1)
+            dst.update_tags(HSI_DESCRIPTION="住房供给潜力指数 (0-1)")
+        
+        print(f"HSI栅格已保存至: {output_path}")
+        return output_path
+
+    save_to_tif(final_grid, config['output_hsi'], raster_meta)
+    print(f"处理完成: HSI指数已保存为栅格")
 
 if __name__ == "__main__":
-    setup_output_metadata()
-    process_ppi_files()
-    print("处理完成！")
+    try:
+        coordinate_transformation()
+    except Exception as e:
+        import traceback
+        print(f"处理过程中发生错误: {e}")
+        print(traceback.format_exc())

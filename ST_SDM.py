@@ -1,218 +1,183 @@
-import os
 import numpy as np
 import rasterio
-from rasterio.merge import merge
-from rasterio.warp import calculate_default_transform, reproject
-from datetime import datetime
-import glob
-import re
+from rasterio.warp import reproject, Resampling
+from scipy.stats import boxcox
+import warnings
+import os
 
-class Config:
-    # 路径配置
-    ppi_dir = "./PPI_output/"
-    hsi_path = "./hsi_results_utm50n.tif"
-    hhi_path = "./poi_hhi_output.tif"
-    output_dir = "./hcewi/"
-    ppi_pattern = r"PPI_sz_clipped_raster_(\d{4})_(\d{2})\.tif$"  # PPI文件名匹配模式
+class HCEProcessor:
+    def __init__(self, hsi_path, hhi_path):
+        # 初始化基础数据
+        self.hsi, self.hsi_meta = self._load_base_data(hsi_path)
+        self.hhi = self._load_base_data(hhi_path)[0]
+        
+        # 生成综合掩膜（非空、非零、双数据有效区域）
+        self.mask = self._create_compound_mask(self.hsi, self.hhi)
+        
+        # 数据预处理（保留原始值）
+        self.hsi_inv = 1 - self._normalize_with_mask(self.hsi)
+        self.hhi_non = np.power(self._normalize_with_mask(self.hhi), 1.5)
 
-    # 空间参考配置（以HSI文件为基准）
-    target_crs = None  # 自动获取
-    target_transform = None
-    target_shape = None
+    def _load_base_data(self, path):
+        """加载基础数据并保留原始值"""
+        with rasterio.open(path) as src:
+            data = src.read(1)
+            return data, src.profile
 
-def setup_output_metadata():
-    """设置输出空间参考元数据"""
-    with rasterio.open(Config.hsi_path) as src:
-        Config.target_crs = src.crs
-        Config.target_transform = src.transform
-        Config.target_shape = src.shape
+    def _create_compound_mask(self, hsi, hhi):
+        """创建复合掩膜：非空、非零、双数据有效区域"""
+        valid_hsi = (~np.isnan(hsi)) & (hsi != 0)
+        valid_hhi = (~np.isnan(hhi)) & (hhi != 0)
+        return valid_hsi & valid_hhi
 
-def parse_ppi_datetime(filename):
-    """使用正则表达式解析时间信息"""
-    match = re.search(Config.ppi_pattern, filename, re.IGNORECASE)
-    if match:
-        year, month = map(int, match.groups())
-        return datetime(year, month, 1)
-    raise ValueError(f"无法解析文件名中的时间信息：{filename}")
+    def _normalize_with_mask(self, data):
+        """基于复合掩膜的归一化"""
+        valid_data = data[self.mask]
+        if valid_data.size == 0:
+            return np.zeros_like(data)
+            
+        min_val = np.min(valid_data)
+        max_val = np.max(valid_data)
+        if max_val - min_val < 1e-10:
+            return np.zeros_like(data)
+            
+        normalized = (data - min_val) / (max_val - min_val)
+        return np.where(self.mask, normalized, np.nan)
 
-def load_static_data(path):
-    """加载静态数据并重投影到目标坐标系"""
-    with rasterio.open(path) as src:
-        # 如果坐标系不一致则自动重投影
-        if src.crs != Config.target_crs:
-            transform, width, height = calculate_default_transform(
-                src.crs, Config.target_crs, src.width, src.height, *src.bounds)
-            data = np.empty((height, width), dtype=np.float32)
+    def _process_ppi(self, ppi_path):
+        """处理PPI数据时应用复合掩膜"""
+        ppi = self._reproject(ppi_path) if self._needs_reproject(ppi_path) else self._load_ppi(ppi_path)
+        return self._safe_boxcox(np.where(self.mask, ppi, np.nan))
+
+    def process_month(self, ppi_path, output_dir):
+        """带复合掩膜的综合计算"""
+        ppi_norm = self._process_ppi(ppi_path)
+        
+        # 构建有效数据矩阵（仅掩膜区域）
+        valid_mask = self.mask.flatten()
+        X = np.stack([
+            ppi_norm.flatten()[valid_mask],
+            self.hsi_inv.flatten()[valid_mask],
+            self.hhi_non.flatten()[valid_mask]
+        ], axis=1)
+
+        # 熵权法计算（仅有效数据）
+        if X.size == 0:
+            print(f"Warning: No valid data for {ppi_path}")
+            return
+            
+        weights = self._entropy_weights(X)
+        
+        # 合成指标计算
+        with np.errstate(invalid='ignore'):
+            hcewi = (
+                weights[0] * ppi_norm +
+                weights[1] * self.hsi_inv +
+                weights[2] * self.hhi_non
+            )
+        
+        # 后处理：保留原始无效区域
+        final_output = np.where(self.mask, np.clip(hcewi, 0, 1), 0.0)
+        self._save_results(final_output, ppi_path, output_dir)
+    
+    def _needs_reproject(self, ppi_path):
+        """判断是否需要重投影"""
+        with rasterio.open(ppi_path) as src:
+            return (src.crs != self.hsi_meta['crs']) or \
+                   (src.transform != self.hsi_meta['transform']) or \
+                   (src.width != self.hsi_meta['width']) or \
+                   (src.height != self.hsi_meta['height'])
+
+    def _reproject(self, ppi_path):
+        """执行重投影到基准坐标系"""
+        with rasterio.open(ppi_path) as src:
+            # 创建目标数组
+            ppi_data = np.empty((self.hsi_meta['height'], self.hsi_meta['width']), 
+                              dtype=np.float32)
+            
+            # 执行重投影
             reproject(
                 source=rasterio.band(src, 1),
-                destination=data,
+                destination=ppi_data,
                 src_transform=src.transform,
                 src_crs=src.crs,
-                dst_transform=transform,
-                dst_crs=Config.target_crs)
-            return data
-        return src.read(1)
+                dst_transform=self.hsi_meta['transform'],
+                dst_crs=self.hsi_meta['crs'],
+                resampling=Resampling.bilinear
+            )
+            return ppi_data
 
-def process_ppi_files():
-    """改进的文件处理函数"""
-    ppi_files = sorted(
-        glob.glob(os.path.join(Config.ppi_dir, "PPI_sz_clipped_raster_*.tif")),
-        key=lambda x: parse_ppi_datetime(os.path.basename(x))
-    )
-    
-    for ppi_file in ppi_files:
-        # 解析时间并过滤
-        date = parse_ppi_datetime(os.path.basename(ppi_file))
-        if date < datetime(2017,6,1) or date > datetime(2019,6,30):
-            continue
+    def _load_ppi(self, ppi_path):
+        """直接加载PPI数据"""
+        with rasterio.open(ppi_path) as src:
+            return src.read(1)
         
-        # 显示处理进度
-        print(f"正在处理：{os.path.basename(ppi_file)}")
-        
-        # 加载和处理数据
-        with rasterio.open(ppi_file) as src:
-            ppi = src.read(1)
-            # 自动重投影对齐
-            if src.crs != Config.target_crs:
-                ppi = reproject_to_target(ppi, src)
-        
-        # 执行计算流程
-        calculate_hcewi_for_month(ppi, date)
+    def _safe_boxcox(self, data):
+        """带异常处理的Box-Cox变换"""
+        valid_data = data[self.mask]
+        if valid_data.size == 0 or np.all(valid_data == valid_data[0]):
+            return np.zeros_like(data)
 
-def reproject_to_target(data, src):
-    """数据重投影到目标坐标系"""
-    transformed = np.empty(Config.target_shape, dtype=np.float32)
-    reproject(
-        source=data,
-        destination=transformed,
-        src_transform=src.transform,
-        src_crs=src.crs,
-        dst_transform=Config.target_transform,
-        dst_crs=Config.target_crs)
-    return transformed
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # 确保数据正值
+            data_shifted = valid_data - np.nanmin(valid_data) + 1e-10
+            try:
+                transformed, _ = boxcox(data_shifted)
+            except ValueError as e:
+                print(f"Box-Cox warning: {str(e)}, using log transform")
+                transformed = np.log(data_shifted + 1e-10)
 
-def safe_normalization(data, name=""):
-    """安全归一化到0-1范围"""
-    data_min = np.nanmin(data)
-    data_max = np.nanmax(data)
-    denominator = data_max - data_min
-    
-    if denominator < 1e-10:
-        print(f"警告：{name}数据值域接近零({data_min:.2f}-{data_max:.2f})，使用默认归一化")
-        normalized = np.zeros_like(data)
-    else:
-        normalized = (data - data_min) / denominator
-        
-    # 处理NaN值
-    normalized = np.nan_to_num(normalized, nan=0.0)
-    return np.clip(normalized, 0, 1)
+        # 归一化处理
+        normalized = (transformed - np.min(transformed)) / (np.ptp(transformed) + 1e-10)
+        output = np.full_like(data, np.nan)
+        output[self.mask] = normalized
+        return np.nan_to_num(output, nan=0.0)
 
-def calculate_hcewi_for_month(ppi, date):
-    """单个月份的HCEWI计算"""
-    # 检查数据有效性
-    if np.all(np.isnan(ppi)):
-        print(f"警告：{date.strftime('%Y%m')} 的PPI数据全为NaN，跳过处理")
-        return
-    
-    # 数据标准化（新添加的0-1归一化）
-    ppi_norm = safe_normalization(ppi, name="PPI")
-    
-    # 加载静态数据（仅首次加载时处理）
-    if not hasattr(Config, 'hsi_norm'):
-        print("加载静态数据...")
-        
-        # 加载并标准化HSI
-        Config.hsi = load_static_data(Config.hsi_path)
-        Config.hsi_norm = safe_normalization(Config.hsi, name="HSI")
-        
-        # 加载并标准化HHI
-        Config.hhi = load_static_data(Config.hhi_path)
-        Config.hhi_norm = safe_normalization(Config.hhi, name="HHI")
-        
-        # 计算空间权重矩阵
-        Config.weights = calculate_spatial_weights(Config.hsi_norm, Config.hhi_norm)
-    
-    # 合成指标（添加安全约束）
-    hcewi = (
-        Config.weights[...,0] * ppi_norm +
-        Config.weights[...,1] * Config.hsi_norm +
-        Config.weights[...,2] * Config.hhi_norm
-    )
-    
-    # 结果后处理
-    hcewi = np.clip(hcewi, 0, 1)  # 强制限定到0-1范围
-    hcewi = np.nan_to_num(hcewi, nan=0.0)  # 清除残留NaN
-    
-    # 输出诊断信息
-    valid_ratio = np.mean((hcewi > 0) & (hcewi < 1)) * 100
-    print(f"[{date.strftime('%Y%m')}] 有效值比例：{valid_ratio:.1f}% 数值范围：({hcewi.min():.3f}, {hcewi.max():.3f})")
-    
-    # 输出结果
-    output_path = os.path.join(Config.output_dir, f"hcewi_{date.strftime('%Y%m')}.tif")
-    write_geotiff(output_path, hcewi)
+    def _entropy_weights(self, X):
+        """带鲁棒性处理的熵权法"""
+        eps = 1e-10
+        # 归一化处理
+        p = (X - np.min(X, axis=0)) / (np.ptp(X, axis=0) + eps)
+        p = (p + eps) / (p.sum(axis=0) + eps * X.shape[0])  # 防止除零
+        e = -np.sum(p * np.log(p + eps), axis=0) / np.log(X.shape[0])
+        d = 1 - e
+        return d / (d.sum() + eps)
 
-def calculate_spatial_weights(hsi, hhi):
-    """改进的空间权重计算方法"""
-    valid_mask = ~np.isnan(hsi) & ~np.isnan(hhi)
-    
-    # 更新变异系数计算方法
-    def safe_cv(data):
-        mean = np.nanmean(data)
-        std = np.nanstd(data)
-        if mean < 1e-10:  # 处理接近零的均值
-            return 0.0
-        return std / mean
-    
-    window_size = 7
-    weights = np.zeros((*hsi.shape, 3))
-    
-    for i in range(hsi.shape[0]):
-        for j in range(hsi.shape[1]):
-            if not valid_mask[i,j]:
-                weights[i,j] = [0.333, 0.333, 0.334]
-                continue
-                
-            i_min = max(0, i - window_size//2)
-            i_max = min(hsi.shape[0], i + window_size//2 + 1)
-            j_min = max(0, j - window_size//2)
-            j_max = min(hsi.shape[1], j + window_size//2 + 1)
-            
-            local_hsi = hsi[i_min:i_max, j_min:j_max]
-            local_hhi = hhi[i_min:i_max, j_min:j_max]
-            
-            # 添加平滑处理
-            w1 = safe_cv(local_hsi) if local_hsi.size > 0 else 0.0
-            w2 = safe_cv(local_hhi) if local_hhi.size > 0 else 0.0
-            w3 = 1.0  # 基础权重
-            
-            # 权重归一化
-            total = w1 + w2 + w3
-            if total < 1e-10:
-                weights[i,j] = [0.333, 0.333, 0.334]
-            else:
-                weights[i,j] = [w1/total, w2/total, w3/total]
-    
-    return weights
+    def _save_results(self, data, ppi_path, output_dir):
+        """增强的保存方法"""
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"HCEWI_{os.path.basename(ppi_path)}")
+        
+        with rasterio.open(output_path, 'w', 
+                         driver=self.hsi_meta['driver'],
+                         height=self.hsi_meta['height'],
+                         width=self.hsi_meta['width'],
+                         count=1,
+                         dtype=np.float32,
+                         crs=self.hsi_meta['crs'],
+                         transform=self.hsi_meta['transform']) as dst:
+            dst.write(data.astype(np.float32), 1)
+            dst.nodata = 0.0
 
-def write_geotiff(path, data):
-    """写入GeoTIFF文件"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with rasterio.open(
-        path,
-        'w',
-        driver='GTiff',
-        height=data.shape[0],
-        width=data.shape[1],
-        count=1,
-        dtype=np.float32,
-        crs=Config.target_crs,
-        transform=Config.target_transform,
-        nodata=np.nan
-    ) as dst:
-        dst.write(data.astype(np.float32), 1)
-    print(f"生成文件：{path}")
 
 if __name__ == "__main__":
-    setup_output_metadata()
-    process_ppi_files()
-    print("处理完成！")
+    # 配置路径
+    processor = HCEProcessor(
+        hsi_path="./hsi_results_utm50n.tif",
+        hhi_path="./poi_hhi_output.tif"
+    )
+    
+    # 处理所有PPI文件
+    ppi_files = [
+        os.path.join("./PPI_output", f) 
+        for f in os.listdir("./PPI_output") 
+        if f.startswith("PPI_") and f.endswith(".tif")
+    ]
+    
+    for ppi_file in ppi_files:
+        print(f"Processing: {os.path.basename(ppi_file)}")
+        processor.process_month(
+            ppi_path=ppi_file,
+            output_dir="./HCEWI"
+        )
