@@ -206,7 +206,7 @@ def analyze_hcewi_timeseries(folder_path, output_folder=None):
     plt.axhline(y=0, color='gray', linestyle='--')
     plt.grid(True, alpha=0.3)
     plt.title("The temporal variation of HCEWI global spatial autocorrelation")
-    plt.xlabel("日期")
+    plt.xlabel("Date")
     plt.ylabel("Moran's I")
     plt.xticks(rotation=45)
     plt.tight_layout()
